@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: tgibot-chat-automation
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT --workers 1
+    healthCheckPath: /health
+    maxShutdownDelaySeconds: 30
+    disk:
+      name: tgibot-state
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: DATA_DIR
+        value: /var/data
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_API_ID
+        sync: false
+      - key: TELEGRAM_API_HASH
+        sync: false
+      - key: ORCAROUTER_API_KEY
+        sync: false
