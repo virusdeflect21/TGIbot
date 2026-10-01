@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator
+from urllib.parse import urlsplit
 
 import httpx
 from fastapi import FastAPI, HTTPException
@@ -50,6 +51,11 @@ AI_REQUESTS_PER_WINDOW = 12
 AI_HISTORY_MESSAGES = 12
 AI_HISTORY_RETENTION_MESSAGES = 24
 AI_NOTICE_WINDOW_SECONDS = 60
+MUTE_PERMISSION_NOTICE_WINDOW_SECONDS = 60 * 60
+RENDER_KEEPALIVE_INTERVAL_SECONDS = 10 * 60
+RENDER_KEEPALIVE_TIMEOUT_SECONDS = 20
+RENDER_KEEPALIVE_RETRIES = 3
+RENDER_KEEPALIVE_RETRY_DELAY_SECONDS = 15
 
 COMMAND_PATTERN = re.compile(
     r"^/([A-Za-z0-9_]+)(?:@([A-Za-z0-9_]+))?(?:\s+(.*))?$", re.DOTALL
@@ -200,11 +206,14 @@ class JsonFormatter(logging.Formatter):
         "enabled",
         "copy_enabled",
         "autobot_enabled",
+        "mute_enabled",
         "can_reply",
+        "can_delete_received_messages",
         "dc_id",
         "status_code",
         "duration_ms",
         "retry_after_seconds",
+        "attempt",
         "reason",
         "model",
     )
@@ -236,6 +245,72 @@ def configure_logging() -> None:
     root.setLevel(level)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+
+def render_ping_url(external_url: str | None) -> str | None:
+    """Return this Render web service's safe liveness URL, if configured."""
+    if not external_url:
+        return None
+    try:
+        parsed = urlsplit(external_url.strip())
+        hostname = parsed.hostname
+        parsed.port  # Validate an optional port before passing the URL to httpx.
+    except ValueError:
+        return None
+    if (
+        parsed.scheme.casefold() != "https"
+        or not hostname
+        or not (hostname.casefold() == "onrender.com" or hostname.casefold().endswith(".onrender.com"))
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        return None
+    return f"https://{parsed.netloc}/ping"
+
+
+async def render_keepalive_loop(ping_url: str) -> None:
+    """Best-effort Render Free wake-up ping using Render's injected service URL."""
+    timeout = httpx.Timeout(RENDER_KEEPALIVE_TIMEOUT_SECONDS, connect=5.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        while True:
+            await asyncio.sleep(RENDER_KEEPALIVE_INTERVAL_SECONDS)
+            for attempt in range(1, RENDER_KEEPALIVE_RETRIES + 1):
+                started = time.monotonic()
+                try:
+                    response = await client.get(ping_url)
+                except asyncio.CancelledError:
+                    raise
+                except httpx.HTTPError as exc:
+                    LOGGER.warning(
+                        "Render self-ping failed",
+                        extra={
+                            "event": "render_keepalive_failed",
+                            "attempt": attempt,
+                            "reason": type(exc).__name__,
+                        },
+                    )
+                    if attempt < RENDER_KEEPALIVE_RETRIES:
+                        await asyncio.sleep(RENDER_KEEPALIVE_RETRY_DELAY_SECONDS * attempt)
+                    continue
+
+                context = {
+                    "event": "render_keepalive_pinged",
+                    "status_code": response.status_code,
+                    "duration_ms": int((time.monotonic() - started) * 1000),
+                    "attempt": attempt,
+                }
+                if response.is_success:
+                    LOGGER.debug("Render self-ping succeeded", extra=context)
+                    break
+
+                LOGGER.warning("Render self-ping returned a non-success status", extra=context)
+                retryable = response.status_code == 429 or response.status_code >= 500
+                if not retryable or attempt == RENDER_KEEPALIVE_RETRIES:
+                    break
+                await asyncio.sleep(RENDER_KEEPALIVE_RETRY_DELAY_SECONDS * attempt)
 
 
 class OrcaRouterError(Exception):
@@ -371,6 +446,9 @@ class TelegramAutomation:
             dc_id=int(connection.dc_id),
             enabled=not bool(getattr(connection, "disabled", False)),
             can_reply=bool(getattr(rights, "reply", False)),
+            can_delete_received_messages=bool(
+                getattr(rights, "delete_received_messages", False)
+            ),
         )
         LOGGER.info(
             "Business connection state saved",
@@ -381,6 +459,7 @@ class TelegramAutomation:
                 "dc_id": info.dc_id,
                 "enabled": info.enabled,
                 "can_reply": info.can_reply,
+                "can_delete_received_messages": info.can_delete_received_messages,
             },
         )
 
@@ -405,7 +484,7 @@ class TelegramAutomation:
 
     async def _get_connection(self, connection_id: str) -> ConnectionInfo | None:
         cached = self.state.get_connection(connection_id)
-        if cached is not None:
+        if cached is not None and cached.can_delete_received_messages is not None:
             return cached
 
         try:
@@ -432,8 +511,8 @@ class TelegramAutomation:
     async def _handle_business_message(self, update: Any) -> None:
         message = update.message
         peer_id = getattr(message, "peer_id", None)
-        # Chat Automation scopes may include groups/channels; this bot's three
-        # commands are deliberately restricted to one-to-one private chats.
+        # Chat Automation scopes may include groups/channels; these commands
+        # and automatic actions are deliberately restricted to one-to-one DMs.
         if not isinstance(peer_id, types.PeerUser):
             LOGGER.info(
                 "Ignoring non-private Chat Automation message",
@@ -447,7 +526,7 @@ class TelegramAutomation:
 
         chat_id = int(peer_id.user_id)
         connection_id = update.connection_id
-        if bool(getattr(message, "out", False)) or getattr(message, "via_bot_id", None) == self.bot_id:
+        if self.bot_id is not None and getattr(message, "via_bot_id", None) == self.bot_id:
             return
 
         info = await self._get_connection(connection_id)
@@ -465,62 +544,228 @@ class TelegramAutomation:
 
         sender = getattr(message, "from_id", None)
         sender_id = sender.user_id if isinstance(sender, types.PeerUser) else chat_id
-        if sender_id == info.owner_id:
-            # Don't answer or echo messages the profile owner wrote manually.
-            return
-        if not info.can_reply:
-            LOGGER.warning(
-                "Connection lacks permission to reply",
-                extra={
-                    "event": "business_reply_permission_missing",
-                    "connection_id": connection_id,
-                    "chat_id": chat_id,
-                    "user_id": sender_id,
-                    "owner_id": info.owner_id,
-                },
-            )
+        text = getattr(message, "message", None) or ""
+        command = parse_command(text, self.bot_username) if text else None
+        mute_command = command is not None and command.name in {"mute", "unmute"}
+        is_owner_message = bool(getattr(message, "out", False)) or sender_id == info.owner_id
+        if is_owner_message and not mute_command:
+            # The profile owner's regular messages must never be copied, deleted,
+            # or answered. Only the owner-facing /mute and /unmute controls pass.
             return
 
         key = (connection_id, chat_id)
         lock = self._chat_locks.setdefault(key, asyncio.Lock())
         async with lock:
+            context = {
+                "connection_id": connection_id,
+                "chat_id": chat_id,
+                "user_id": sender_id,
+                "message_id": getattr(message, "id", None),
+            }
+
+            # The unmute control is checked before the mute filter, so it remains
+            # usable even when every other incoming message is being deleted.
+            if mute_command:
+                input_peer = None
+                if info.can_reply:
+                    try:
+                        input_peer = await self.client.get_input_entity(peer_id)
+                    except Exception:
+                        LOGGER.exception(
+                            "Could not resolve the chat for a mute command reply",
+                            extra={"event": "business_peer_resolution_failed", **context},
+                        )
+                await self._handle_mute_command(
+                    command,
+                    info,
+                    chat_id,
+                    input_peer,
+                    context,
+                )
+                return
+
+            mode = self.state.get_mode(connection_id, chat_id)
+            if mode.mute_enabled:
+                if info.can_delete_received_messages:
+                    await self._delete_received_message(info, message, chat_id)
+                else:
+                    await self._warn_mute_permission_missing(info, peer_id, context)
+                return
+
+            if not info.can_reply:
+                LOGGER.warning(
+                    "Connection lacks permission to reply",
+                    extra={"event": "business_reply_permission_missing", **context},
+                )
+                return
+
             try:
                 input_peer = await self.client.get_input_entity(peer_id)
             except Exception:
                 LOGGER.exception(
                     "Could not resolve the private chat peer",
-                    extra={
-                        "event": "business_peer_resolution_failed",
-                        "connection_id": connection_id,
-                        "chat_id": chat_id,
-                        "user_id": sender_id,
-                    },
+                    extra={"event": "business_peer_resolution_failed", **context},
                 )
                 return
 
-            text = getattr(message, "message", None) or ""
-            command = parse_command(text, self.bot_username) if text else None
             if command is not None and command.name in {"spam", "copy", "autobot"}:
                 await self._handle_command(command, info, input_peer, chat_id, message)
                 return
 
-            mode = self.state.get_mode(connection_id, chat_id)
             LOGGER.info(
                 "Private Chat Automation message received",
                 extra={
                     "event": "business_message_received",
-                    "connection_id": connection_id,
-                    "chat_id": chat_id,
-                    "user_id": sender_id,
-                    "message_id": getattr(message, "id", None),
+                    **context,
                     "copy_enabled": mode.copy_enabled,
                     "autobot_enabled": mode.autobot_enabled,
+                    "mute_enabled": mode.mute_enabled,
                 },
             )
             if mode.copy_enabled:
                 await self._copy_message(info, input_peer, chat_id, message)
             elif mode.autobot_enabled:
                 await self._autobot_reply(info, input_peer, chat_id, message)
+
+    async def _handle_mute_command(
+        self,
+        command: Command,
+        info: ConnectionInfo,
+        chat_id: int,
+        peer: Any | None,
+        context: dict[str, Any],
+    ) -> None:
+        enabling = command.name == "mute"
+        argument = command.args.strip().casefold()
+        valid_arguments = {"", "on"} if enabling else {"", "off"}
+        if argument not in valid_arguments:
+            expected = "/mute [on]" if enabling else "/unmute [off]"
+            if info.can_reply and peer is not None:
+                await self._safe_reply(info, peer, f"Usage: {expected}.", context)
+            LOGGER.warning("Invalid mute command", extra={"event": "command_invalid", **context})
+            return
+
+        if enabling and not info.can_delete_received_messages:
+            if info.can_reply and peer is not None:
+                await self._safe_reply(
+                    info,
+                    peer,
+                    "Mute was not enabled. Grant this bot the Telegram Business permission to delete received messages, then try /mute again.",
+                    context,
+                )
+            LOGGER.warning(
+                "Mute could not be enabled without delete permission",
+                extra={
+                    "event": "mute_permission_missing",
+                    "can_delete_received_messages": False,
+                    **context,
+                },
+            )
+            return
+
+        updated = self.state.change_mute(info.connection_id, chat_id, enabling)
+        LOGGER.info(
+            "Conversation mute state changed",
+            extra={
+                "event": "mute_changed",
+                "connection_id": info.connection_id,
+                "chat_id": chat_id,
+                "user_id": chat_id,
+                "command": command.name,
+                "enabled": updated.mute_enabled,
+                "mute_enabled": updated.mute_enabled,
+            },
+        )
+
+        if enabling:
+            notice = (
+                "Mute is on for this DM. New incoming messages will be deleted until /unmute. "
+                "Earlier messages are not deleted."
+            )
+        else:
+            notice = "Mute is off for this DM. New incoming messages will stay in the chat."
+        if info.can_reply and peer is not None:
+            await self._safe_reply(info, peer, notice, context)
+
+    async def _delete_received_message(
+        self,
+        info: ConnectionInfo,
+        message: Any,
+        chat_id: int,
+    ) -> None:
+        message_id = getattr(message, "id", None)
+        context = {
+            "event": "mute_delete_failed",
+            "connection_id": info.connection_id,
+            "chat_id": chat_id,
+            "user_id": chat_id,
+            "message_id": message_id,
+        }
+        if not isinstance(message_id, int) or message_id <= 0:
+            LOGGER.error("Muted message has no valid Telegram message ID", extra=context)
+            return
+
+        request = functions.messages.DeleteMessagesRequest(id=[message_id], revoke=True)
+        try:
+            await self._invoke_business(info, request)
+        except asyncio.CancelledError:
+            raise
+        except FloodWaitError as exc:
+            LOGGER.warning(
+                "Telegram rate-limited a muted-message deletion",
+                extra={
+                    **context,
+                    "event": "mute_delete_rate_limited",
+                    "retry_after_seconds": exc.seconds,
+                },
+            )
+        except Exception:
+            LOGGER.exception("Could not delete a muted incoming message", extra=context)
+        else:
+            LOGGER.info(
+                "Muted incoming message deleted",
+                extra={**context, "event": "muted_message_deleted"},
+            )
+
+    async def _warn_mute_permission_missing(
+        self,
+        info: ConnectionInfo,
+        peer_id: Any,
+        context: dict[str, Any],
+    ) -> None:
+        LOGGER.warning(
+            "Mute is on but Telegram delete permission is missing",
+            extra={
+                "event": "mute_permission_missing",
+                "can_delete_received_messages": False,
+                **context,
+            },
+        )
+        if not info.can_reply:
+            return
+        notice_after = self.state.consume_limit(
+            "mute_permission_notice",
+            info.connection_id,
+            int(context["chat_id"]),
+            1,
+            MUTE_PERMISSION_NOTICE_WINDOW_SECONDS,
+        )
+        if notice_after is not None:
+            return
+        try:
+            peer = await self.client.get_input_entity(peer_id)
+        except Exception:
+            LOGGER.exception(
+                "Could not resolve the chat for a mute permission notice",
+                extra={"event": "business_peer_resolution_failed", **context},
+            )
+            return
+        await self._safe_reply(
+            info,
+            peer,
+            "Mute is enabled, but Telegram no longer allows this bot to delete incoming messages. Restore the delete-received-messages permission or use /unmute.",
+            context,
+        )
 
     async def _handle_command(
         self,
@@ -1022,6 +1267,7 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     ai: OrcaRouter | None = None
     client: TelegramClient | None = None
     telegram_task: asyncio.Task[None] | None = None
+    keepalive_task: asyncio.Task[None] | None = None
     runtime: Runtime | None = None
 
     try:
@@ -1102,6 +1348,29 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
                 )
 
         telegram_task.add_done_callback(telegram_task_finished)
+
+        ping_url = render_ping_url(os.environ.get("RENDER_EXTERNAL_URL"))
+        application.state.render_keepalive_task = None
+        if ping_url is not None:
+            keepalive_task = asyncio.create_task(
+                render_keepalive_loop(ping_url),
+                name="render-self-keepalive",
+            )
+            application.state.render_keepalive_task = keepalive_task
+            LOGGER.info(
+                "Automatic Render self-ping enabled",
+                extra={
+                    "event": "render_keepalive_started",
+                    "reason": f"pinging every {RENDER_KEEPALIVE_INTERVAL_SECONDS} seconds",
+                },
+            )
+        else:
+            application.state.render_keepalive_task = None
+            LOGGER.info(
+                "Automatic Render self-ping is not enabled",
+                extra={"event": "render_keepalive_skipped", "reason": "RENDER_EXTERNAL_URL is not a valid HTTPS URL"},
+            )
+
         yield
     except Exception:
         LOGGER.exception("Application startup or runtime failed", extra={"event": "application_failed"})
@@ -1110,6 +1379,10 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         if runtime is not None:
             runtime.stopping = True
         application.state.runtime = None
+        if keepalive_task is not None:
+            keepalive_task.cancel()
+            await asyncio.gather(keepalive_task, return_exceptions=True)
+        application.state.render_keepalive_task = None
         if client is not None:
             try:
                 await client.disconnect()
@@ -1137,6 +1410,7 @@ app = FastAPI(title="TGIbot Chat Automation", lifespan=lifespan)
 
 @app.get("/health")
 async def health() -> dict[str, str]:
+    """Readiness check: only healthy when the Telegram update connection is live."""
     runtime: Runtime | None = getattr(app.state, "runtime", None)
     if (
         runtime is None
@@ -1145,3 +1419,13 @@ async def health() -> dict[str, str]:
     ):
         raise HTTPException(status_code=503, detail="Telegram MTProto connection is not ready")
     return {"status": "ok"}
+
+
+@app.get("/ping", include_in_schema=False)
+async def ping() -> dict[str, str]:
+    """Lightweight liveness route for external Render Free wake-up probes.
+
+    Unlike /health, this endpoint does not require the Telegram connection to be
+    ready. It confirms only that the FastAPI process can accept HTTP requests.
+    """
+    return {"status": "alive"}
