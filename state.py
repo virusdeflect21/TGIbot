@@ -33,7 +33,8 @@ class StateStore:
     """Small, single-instance durable store; all writes use SQLite transactions."""
 
     def __init__(self, path: Path) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self._path = path
         self._lock = threading.RLock()
         self._db = sqlite3.connect(
             str(path),
@@ -52,12 +53,19 @@ class StateStore:
 
     @staticmethod
     def _restrict_file_permissions(path: Path) -> None:
-        try:
-            path.chmod(0o600)
-        except OSError:
-            # Render's filesystem policy may not permit chmod; SQLite still
-            # operates normally, and the persistent disk remains service-scoped.
-            pass
+        # SQLite's WAL and shared-memory sidecars may contain conversation text,
+        # so protect them as well as the main database wherever chmod is supported.
+        for file_path in (
+            path,
+            path.with_name(path.name + "-wal"),
+            path.with_name(path.name + "-shm"),
+        ):
+            try:
+                file_path.chmod(0o600)
+            except OSError:
+                # Some mounted filesystems may not permit chmod; SQLite can still
+                # operate normally, and the Render disk is service-scoped.
+                pass
 
     def _create_schema(self) -> None:
         with self._lock:
@@ -119,7 +127,7 @@ class StateStore:
 
     def _transaction(self):
         """Start an immediate transaction while holding the connection lock."""
-        return _Transaction(self._db, self._lock)
+        return _Transaction(self._db, self._lock, self._path)
 
     def save_connection(
         self,
@@ -331,9 +339,15 @@ class StateStore:
 class _Transaction:
     """Context manager for serial, rollback-safe writes on the shared connection."""
 
-    def __init__(self, db: sqlite3.Connection, lock: threading.RLock) -> None:
+    def __init__(
+        self,
+        db: sqlite3.Connection,
+        lock: threading.RLock,
+        path: Path,
+    ) -> None:
         self._db = db
         self._lock = lock
+        self._path = path
 
     def __enter__(self) -> None:
         self._lock.acquire()
@@ -342,14 +356,24 @@ class _Transaction:
         except Exception:
             self._lock.release()
             raise
-        return None
 
     def __exit__(self, exc_type, exc_value, traceback) -> bool:
         try:
             if exc_type is None:
-                self._db.execute("COMMIT")
-            else:
+                try:
+                    self._db.execute("COMMIT")
+                except Exception:
+                    if self._db.in_transaction:
+                        try:
+                            self._db.execute("ROLLBACK")
+                        except sqlite3.Error:
+                            pass
+                    raise
+            elif self._db.in_transaction:
                 self._db.execute("ROLLBACK")
         finally:
-            self._lock.release()
+            try:
+                StateStore._restrict_file_permissions(self._path)
+            finally:
+                self._lock.release()
         return False
