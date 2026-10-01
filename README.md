@@ -61,7 +61,7 @@ A healthy process returns `{"status":"ok"}` from `/health` only while its MTProt
 
 ## State, privacy, and operations
 
-`state.py` stores connection permissions, copy/autobot modes, rate-limit windows, and recent AI conversation turns in SQLite. SQLite uses transactions, WAL, and `synchronous=FULL`; the Telegram MTProto authorization session is stored separately in the same data directory and restricted to owner-readable permissions where supported. The last 24 AI history messages per conversation are retained for context and history older than 30 days is pruned when the service starts. Text and captions in autobot-enabled chats are sent to OrcaRouter; media bytes are not. Do not share or expose the persistent disk.
+`state.py` stores connection permissions, copy/autobot modes, rate-limit windows, and recent AI conversation turns in SQLite. SQLite uses transactions, WAL, and `synchronous=FULL`. The runtime data directory is restricted to owner-only access where supported; the database, SQLite WAL/shared-memory sidecars, and Telegram MTProto authorization session are also restricted to owner-only permissions. The last 24 AI history messages per conversation are retained for context and history older than 30 days is pruned when the service starts. Text and captions in autobot-enabled chats are sent to OrcaRouter; media bytes are not. Do not share or expose the persistent disk.
 
 Logs are newline-delimited JSON with UTC timestamps, event names, connection/chat/user IDs, command names, API status, and elapsed time. Message contents and secrets are intentionally excluded.
 

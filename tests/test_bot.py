@@ -1,18 +1,24 @@
 from __future__ import annotations
 
+import os
+import stat
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 from app import (
     MAX_MESSAGE_UNITS,
+    TELEGRAM_MAX_MESSAGE_UNITS,
     Command,
+    TelegramAutomation,
     parse_command,
     parse_spam_args,
+    prepare_data_directory,
     split_telegram_text,
     utf16_length,
 )
-from state import ConversationMode, StateStore
+from state import ConnectionInfo, ConversationMode, StateStore
 
 
 class CommandParsingTests(unittest.TestCase):
@@ -42,6 +48,45 @@ class CommandParsingTests(unittest.TestCase):
         chunks = split_telegram_text(text)
         self.assertEqual("".join(chunks), text)
         self.assertTrue(all(utf16_length(chunk) <= MAX_MESSAGE_UNITS for chunk in chunks))
+
+
+class TelegramMessageSendingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_send_text_accepts_telegram_maximum_message_length(self) -> None:
+        automation = object.__new__(TelegramAutomation)
+        automation._invoke_business = AsyncMock()
+        info = ConnectionInfo("bc-test", 1, 2, True, True)
+        text = "x" * TELEGRAM_MAX_MESSAGE_UNITS
+
+        await automation._send_text(info, object(), text)
+
+        automation._invoke_business.assert_awaited_once()
+
+    async def test_send_text_rejects_text_over_telegram_limit(self) -> None:
+        automation = object.__new__(TelegramAutomation)
+        automation._invoke_business = AsyncMock()
+        info = ConnectionInfo("bc-test", 1, 2, True, True)
+
+        with self.assertRaises(ValueError):
+            await automation._send_text(
+                info,
+                object(),
+                "x" * (TELEGRAM_MAX_MESSAGE_UNITS + 1),
+            )
+
+        automation._invoke_business.assert_not_awaited()
+
+
+@unittest.skipUnless(os.name == "posix", "POSIX file permissions are required")
+class RuntimeFilePermissionTests(unittest.TestCase):
+    def test_existing_data_directory_is_restricted(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_dir = Path(temp_dir) / "data"
+            data_dir.mkdir(mode=0o755)
+            data_dir.chmod(0o755)
+
+            prepare_data_directory(data_dir)
+
+            self.assertEqual(stat.S_IMODE(data_dir.stat().st_mode), 0o700)
 
 
 class StateStoreTests(unittest.TestCase):
@@ -77,6 +122,17 @@ class StateStoreTests(unittest.TestCase):
     def test_connection_metadata_round_trips(self) -> None:
         expected = self.store.save_connection("bc-2", 42, 4, True, True)
         self.assertEqual(self.store.get_connection("bc-2"), expected)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX file permissions are required")
+    def test_database_and_sqlite_sidecars_are_owner_only(self) -> None:
+        self.store.save_connection("bc-private", 42, 4, True, True)
+
+        self.assertEqual(stat.S_IMODE(self.db_path.stat().st_mode), 0o600)
+        for suffix in ("-wal", "-shm"):
+            sidecar = Path(f"{self.db_path}{suffix}")
+            if sidecar.exists():
+                with self.subTest(sidecar=sidecar.name):
+                    self.assertEqual(stat.S_IMODE(sidecar.stat().st_mode), 0o600)
 
     def test_fixed_window_rate_limit(self) -> None:
         scope, connection_id, user_id = "spam", "bc-rate", 456

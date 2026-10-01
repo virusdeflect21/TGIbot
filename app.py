@@ -14,11 +14,12 @@ import os
 import re
 import secrets
 import time
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any
 
 import httpx
 from fastapi import FastAPI, HTTPException
@@ -39,7 +40,8 @@ SYSTEM_PROMPT = (
 )
 
 MAX_SPAM_COUNT = 10
-MAX_MESSAGE_UNITS = 3900  # UTF-16 units; stay below Telegram's message length limit.
+MAX_MESSAGE_UNITS = 3900  # UTF-16 units; leave headroom for bot-generated messages.
+TELEGRAM_MAX_MESSAGE_UNITS = 4096  # Incoming messages may use Telegram's full text limit.
 SPAM_WINDOW_SECONDS = 60
 SPAM_COMMANDS_PER_WINDOW = 1
 SPAM_SEND_INTERVAL_SECONDS = 1.05
@@ -92,6 +94,23 @@ class Settings:
             telegram_api_hash=required("TELEGRAM_API_HASH"),
             orcarouter_api_key=required("ORCAROUTER_API_KEY"),
             data_dir=Path(os.environ.get("DATA_DIR", "./data")).expanduser(),
+        )
+
+
+def prepare_data_directory(data_dir: Path) -> None:
+    """Create a private runtime directory for the Telegram session and SQLite state."""
+    data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        # mkdir's mode is ignored when the directory already exists (as on Render
+        # persistent disks), so tighten it explicitly before creating sensitive files.
+        data_dir.chmod(0o700)
+    except OSError as exc:
+        LOGGER.warning(
+            "Could not restrict runtime data directory permissions",
+            extra={
+                "event": "data_directory_permissions_unavailable",
+                "reason": type(exc).__name__,
+            },
         )
 
 
@@ -983,8 +1002,10 @@ class TelegramAutomation:
         text: str,
         entities: list[Any] | None = None,
     ) -> None:
-        if not text or utf16_length(text) > MAX_MESSAGE_UNITS:
-            raise ValueError("Telegram message must contain 1-3900 UTF-16 units")
+        if not text or utf16_length(text) > TELEGRAM_MAX_MESSAGE_UNITS:
+            raise ValueError(
+                f"Telegram message must contain 1-{TELEGRAM_MAX_MESSAGE_UNITS} UTF-16 units"
+            )
         request = functions.messages.SendMessageRequest(
             peer=peer,
             message=text,
@@ -1026,7 +1047,7 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
 
     try:
         settings = Settings.from_env()
-        settings.data_dir.mkdir(parents=True, exist_ok=True)
+        prepare_data_directory(settings.data_dir)
         state = StateStore(settings.data_dir / "tgibot.sqlite3")
         ai = OrcaRouter(settings.orcarouter_api_key)
 
