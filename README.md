@@ -4,6 +4,12 @@ A Python bot for Telegram's **profile Chat Automation / Connected Business Bots*
 
 **This implementation does not call Bot API `getUpdates` and does not register a webhook.** Telegram's profile-side Chat Automation connection determines which chats are shared with the bot; the service uses MTProto's persistent connection to receive `updateBotBusinessConnect` / `updateBotNewBusinessMessage` updates and `invokeWithBusinessConnection` to reply. This is the native connected-bot path, not an HTTP webhook adapter.
 
+## Run it locally
+
+Download the **Source code (zip)** from the GitHub **Releases** page and extract it. Copy `config.example.py` to `config.py`, add your Telegram credentials, install Python 3.12 and the pinned packages, then start the bot with `python run.py`. The complete Windows/macOS/Linux walkthrough, Telegram setup, and troubleshooting steps are in [LOCAL_SETUP.md](LOCAL_SETUP.md).
+
+No Docker, Node.js, or separate database is needed. The computer must stay online with the bot process running. `config.py` is local-only, ignored by Git, and intentionally not included in the release ZIP.
+
 ## Telegram setup
 
 1. Create a bot with [@BotFather](https://t.me/BotFather). In BotFather, enable **Business Mode** (also referred to as Secretary Mode in the bot guide) so the bot can be connected to a profile.
@@ -27,15 +33,15 @@ Copy and autobot are mutually exclusive. Mute is an independent override: while 
 
 ## Configuration
 
-Add these values in the Render service's **Environment** settings. Do not commit credentials or put them in source code.
+For a local run, copy `config.example.py` to `config.py` and fill in `TELEGRAM_BOT_TOKEN`, `TELEGRAM_API_ID`, and `TELEGRAM_API_HASH`. `ORCAROUTER_API_KEY` is optional unless you want `/autobot`. `DATA_DIR` defaults to `./data`. The app reads environment variables first (useful for Render/hosting), then falls back to the adjacent local `config.py` file. Never commit or share real credentials; `config.py` is ignored by Git and excluded from release ZIPs.
 
-| Environment variable | Purpose |
-| --- | --- |
-| `TELEGRAM_BOT_TOKEN` | Token from @BotFather |
-| `TELEGRAM_API_ID` | Telegram app ID from my.telegram.org |
-| `TELEGRAM_API_HASH` | Telegram app hash from my.telegram.org |
-| `ORCAROUTER_API_KEY` | OrcaRouter API key used for AI replies; currently required for the service to start |
-| `DATA_DIR` | Optional state directory (defaults to `./data`). Leave unset on Render Free; its filesystem is temporary. Set it to the mount path only if you attach a persistent disk to a paid service. |
+| Setting | Required? | Purpose |
+| --- | --- | --- |
+| `TELEGRAM_BOT_TOKEN` | Yes | Token from @BotFather |
+| `TELEGRAM_API_ID` | Yes | Telegram app ID from my.telegram.org |
+| `TELEGRAM_API_HASH` | Yes | Telegram app hash from my.telegram.org |
+| `ORCAROUTER_API_KEY` | Only for `/autobot` | OrcaRouter API key for AI replies |
+| `DATA_DIR` | No | State/session directory (defaults to `./data`; on Render, use a mount path only with a persistent disk) |
 
 OrcaRouter calls `https://api.orcarouter.ai/v1/chat/completions` with the OpenAI-compatible `messages` payload. Requests have bounded connection/read timeouts. Timeouts, connection failures, malformed responses, upstream errors, and HTTP 429s are logged and receive a safe user-facing error; prompts and API keys are not written to logs.
 
@@ -54,7 +60,7 @@ This project can be deployed as a regular Render **Web Service**. You do not nee
    | Start Command | `uvicorn app:app --host 0.0.0.0 --port $PORT --workers 1` |
    | Health Check Path | `/health` (under **Advanced**) |
 
-5. In **Environment**, add `TELEGRAM_BOT_TOKEN`, `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, and `ORCAROUTER_API_KEY` with the values from the setup steps above. On Free, leave `DATA_DIR` unset and do not add a disk.
+5. In **Environment**, add `TELEGRAM_BOT_TOKEN`, `TELEGRAM_API_ID`, and `TELEGRAM_API_HASH` with the values from the setup steps above. Add `ORCAROUTER_API_KEY` only if you want `/autobot`. On Free, leave `DATA_DIR` unset and do not add a disk.
 6. Click **Create Web Service**. Once the deploy is live, `https://<your-service>.onrender.com/health` should return `{"status":"ok"}` after Telegram connects. `/ping` is a lightweight liveness endpoint and returns `{"status":"alive"}` while the web process is serving requests.
 
 After deployment, connect the bot to your Telegram profile under **Settings → Chat Automation**, choose the chats and permissions it may access, and use `/autobot on` or `/copy on` in the private chat where you want that mode. The bot receives updates over MTProto; no Telegram webhook URL or Bot API polling configuration is needed.
@@ -71,19 +77,13 @@ For dependable always-on operation and state that survives restarts, use a paid 
 
 ### Local run
 
+See the step-by-step [local setup guide](LOCAL_SETUP.md) for Python installation, the private `config.py` file, virtual-environment commands for Windows/macOS/Linux, and Telegram profile setup. Once packages are installed and credentials are configured, run:
+
 ```bash
-python -m venv .venv
-. .venv/bin/activate
-pip install -r requirements.txt
-export TELEGRAM_BOT_TOKEN='…'
-export TELEGRAM_API_ID='…'
-export TELEGRAM_API_HASH='…'
-export ORCAROUTER_API_KEY='…'
-export DATA_DIR='./data'
-uvicorn app:app --host 0.0.0.0 --port 8000 --workers 1
+python run.py
 ```
 
-A healthy process returns `{"status":"ok"}` from `/health` only while its MTProto connection is connected. Uvicorn's ASGI lifespan closes the Telegram client and HTTP client on shutdown; SQLite transactions make mode changes atomic. Keep the service at one instance because Telegram's session and local SQLite database are single-instance state.
+The local launcher binds to `127.0.0.1:8000`. A healthy process returns `{"status":"ok"}` from `/health` only while its MTProto connection is connected. Uvicorn's ASGI lifespan closes the Telegram client and HTTP client on shutdown; SQLite transactions make mode changes atomic. Keep the service at one instance because Telegram's session and local SQLite database are single-instance state.
 
 ## State, privacy, and operations
 
@@ -91,9 +91,13 @@ A healthy process returns `{"status":"ok"}` from `/health` only while its MTProt
 
 Logs are newline-delimited JSON with UTC timestamps, event names, connection/chat/user IDs, command names, API status, and elapsed time. Message contents and secrets are intentionally excluded.
 
+## Release ZIP
+
+The source tree includes a safe ZIP builder. From the repository root, run `python scripts/build_release.py 1.0.0`; it writes `dist/TGIbot-local-v1.0.0.zip`. The builder includes only an explicit file allowlist, so `config.py`, Telegram sessions, databases, and virtual environments are not packaged.
+
 ## Tests
 
-Run the parser, mode persistence/migrations, mute behavior, delete-permission, keep-alive URL, rate-limit, history-isolation, and Unicode-length checks with:
+Run the parser, local/environment configuration, mode persistence/migrations, mute behavior, delete-permission, keep-alive URL, release-archive safety, rate-limit, history-isolation, and Unicode-length checks with:
 
 ```bash
 python -m unittest discover -s tests -v

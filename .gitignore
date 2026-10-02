@@ -1,7 +1,11 @@
 # Local configuration and secrets
+/config.py
 .env
 .env.*
 !.env.example
+
+# Generated release archives
+/dist/
 
 # Python environments and caches
 .venv/
