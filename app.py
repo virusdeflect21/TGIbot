@@ -12,9 +12,10 @@ import json
 import logging
 import os
 import re
+import runpy
 import secrets
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -70,36 +71,79 @@ class Settings:
     telegram_bot_id: int
     telegram_api_id: int
     telegram_api_hash: str
-    orcarouter_api_key: str
+    orcarouter_api_key: str | None
     data_dir: Path
 
     @classmethod
-    def from_env(cls) -> Settings:
-        def required(name: str) -> str:
-            value = os.environ.get(name, "").strip()
-            if not value:
-                raise ValueError(f"Required environment variable {name} is missing")
-            return value
+    def from_env(
+        cls,
+        environ: Mapping[str, str] | None = None,
+        config_path: Path | None = None,
+    ) -> Settings:
+        """Load settings from local config.py, with environment overrides.
 
+        Environment variables take precedence so hosted deployments can keep
+        using their platform's secret manager. For a local install, copy
+        config.example.py to config.py and put credentials in that ignored file.
+        """
+        environment = os.environ if environ is None else environ
+        local_path = config_path or Path(__file__).resolve().with_name("config.py")
         try:
-            api_id = int(required("TELEGRAM_API_ID"))
-        except ValueError as exc:
-            raise ValueError("TELEGRAM_API_ID must be a positive integer") from exc
+            local_config = runpy.run_path(str(local_path)) if local_path.is_file() else {}
+        except Exception:
+            # Do not include arbitrary config exception text in logs: a user's
+            # local config could accidentally put credential values in it.
+            raise ValueError("Could not load config.py; check its syntax and file permissions") from None
+
+        def value(name: str, default: Any = None) -> Any:
+            if name in environment:
+                return environment[name]
+            return local_config.get(name, default)
+
+        def required(name: str) -> str:
+            raw_value = value(name)
+            result = "" if raw_value is None else str(raw_value).strip()
+            if not result:
+                raise ValueError(
+                    f"Required setting {name} is missing. Set it in config.py or the environment."
+                )
+            return result
+
+        api_id_text = required("TELEGRAM_API_ID")
+        if not api_id_text.isascii() or not api_id_text.isdigit():
+            raise ValueError("TELEGRAM_API_ID must be a positive integer")
+        api_id = int(api_id_text)
         if api_id <= 0:
             raise ValueError("TELEGRAM_API_ID must be a positive integer")
 
         bot_token = required("TELEGRAM_BOT_TOKEN")
-        bot_id_text, separator, _ = bot_token.partition(":")
-        if not separator or not bot_id_text.isdigit():
+        bot_id_text, separator, bot_secret = bot_token.partition(":")
+        if (
+            not separator
+            or not bot_id_text.isascii()
+            or not bot_id_text.isdigit()
+            or int(bot_id_text) <= 0
+            or not bot_secret
+            or any(character.isspace() for character in bot_token)
+        ):
             raise ValueError("TELEGRAM_BOT_TOKEN is malformed")
+
+        api_hash = required("TELEGRAM_API_HASH")
+        raw_orcarouter_key = value("ORCAROUTER_API_KEY", "")
+        orcarouter_key_text = str(raw_orcarouter_key).strip() if raw_orcarouter_key else ""
+        orcarouter_key = orcarouter_key_text or None
+        raw_data_dir = value("DATA_DIR", "./data")
+        data_dir = str(raw_data_dir).strip() if raw_data_dir is not None else "./data"
+        if not data_dir:
+            data_dir = "./data"
 
         return cls(
             telegram_bot_token=bot_token,
             telegram_bot_id=int(bot_id_text),
             telegram_api_id=api_id,
-            telegram_api_hash=required("TELEGRAM_API_HASH"),
-            orcarouter_api_key=required("ORCAROUTER_API_KEY"),
-            data_dir=Path(os.environ.get("DATA_DIR", "./data")).expanduser(),
+            telegram_api_hash=api_hash,
+            orcarouter_api_key=orcarouter_key,
+            data_dir=Path(data_dir).expanduser(),
         )
 
 
@@ -424,7 +468,7 @@ class TelegramAutomation:
         self,
         client: TelegramClient,
         state: StateStore,
-        ai: OrcaRouter,
+        ai: OrcaRouter | None,
     ) -> None:
         self.client = client
         self.state = state
@@ -945,6 +989,20 @@ class TelegramAutomation:
         )
         enabled = (not current_enabled) if not argument else argument == "on"
 
+        if mode_name == "autobot" and enabled and self.ai is None:
+            await self._safe_reply(
+                info,
+                peer,
+                "Autobot is unavailable because ORCAROUTER_API_KEY is not configured. "
+                "Add it to config.py or the service environment, then restart the bot.",
+                context,
+            )
+            LOGGER.warning(
+                "Autobot activation requested without an AI API key",
+                extra={"event": "autobot_unavailable", **context},
+            )
+            return
+
         # Turning autobot off is never blocked: rate limiting only applies to
         # activations, so users can always stop automated AI replies promptly.
         if mode_name == "autobot" and enabled and not current.autobot_enabled:
@@ -1108,6 +1166,24 @@ class TelegramAutomation:
             "message_id": getattr(message, "id", None),
             "model": ORCAROUTER_MODEL,
         }
+        if self.ai is None:
+            notice_after = self.state.consume_limit(
+                "ai_config_notice",
+                info.connection_id,
+                chat_id,
+                1,
+                AI_NOTICE_WINDOW_SECONDS,
+            )
+            if notice_after is None:
+                await self._safe_reply(
+                    info,
+                    peer,
+                    "Autobot is unavailable because ORCAROUTER_API_KEY is not configured. "
+                    "Add it to config.py or the service environment, then restart the bot.",
+                    context,
+                )
+            return
+
         if utf16_length(user_content) > MAX_MESSAGE_UNITS:
             await self._safe_reply(
                 info,
@@ -1316,7 +1392,15 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         settings = Settings.from_env()
         prepare_data_directory(settings.data_dir)
         state = StateStore(settings.data_dir / "tgibot.sqlite3")
-        ai = OrcaRouter(settings.orcarouter_api_key)
+        if settings.orcarouter_api_key:
+            ai = OrcaRouter(settings.orcarouter_api_key)
+            LOGGER.info("AI reply provider configured", extra={"event": "ai_provider_configured"})
+        else:
+            ai = None
+            LOGGER.warning(
+                "AI replies are disabled because ORCAROUTER_API_KEY is not configured",
+                extra={"event": "ai_provider_not_configured"},
+            )
 
         session_base = settings.data_dir / "telegram-session"
         client = TelegramClient(

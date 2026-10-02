@@ -279,6 +279,13 @@ class TelegramMuteTests(unittest.TestCase):
             self.client.business_requests[0].query.message.casefold(),
         )
 
+    def test_ai_mode_cannot_be_enabled_without_an_api_key(self) -> None:
+        asyncio.run(self.automation._handle_business_message(self.update("/autobot on")))
+
+        self.assertFalse(self.store.get_mode(self.connection_id, self.chat_id).autobot_enabled)
+        self.assertEqual(len(self.client.business_requests), 1)
+        self.assertIn("ORCAROUTER_API_KEY", self.client.business_requests[0].query.message)
+
 
 class TelegramMessageSendingTests(unittest.IsolatedAsyncioTestCase):
     async def test_send_text_accepts_telegram_maximum_message_length(self) -> None:
