@@ -6,7 +6,7 @@ A Python bot for Telegram's **profile Chat Automation / Connected Business Bots*
 
 ## Run it locally
 
-Download the single `TGIbot-local-v1.0.0.zip` asset from the GitHub **Releases** page, extract it, copy `config.example.py` to `config.py`, and add your Telegram credentials. Install Python 3.12, then install the pinned packages with `python -m pip install -r requirements.txt` and start the bot with `python run.py`. The complete Windows/macOS/Linux walkthrough, Telegram setup, and troubleshooting steps are in [LOCAL_SETUP.md](LOCAL_SETUP.md).
+Download the **Source code (zip)** from the GitHub **Releases** page and extract it. Copy `config.example.py` to `config.py`, add your Telegram credentials, install Python 3.12 and the pinned packages, then start the bot with `python run.py`. The complete Windows/macOS/Linux walkthrough, Telegram setup, and troubleshooting steps are in [LOCAL_SETUP.md](LOCAL_SETUP.md).
 
 No Docker, Node.js, or separate database is needed. The computer must stay online with the bot process running. `config.py` is local-only, ignored by Git, and intentionally not included in the release ZIP.
 
