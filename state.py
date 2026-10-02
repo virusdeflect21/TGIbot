@@ -18,6 +18,7 @@ from pathlib import Path
 class ConversationMode:
     copy_enabled: bool = False
     autobot_enabled: bool = False
+    mute_enabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -27,6 +28,7 @@ class ConnectionInfo:
     dc_id: int
     enabled: bool
     can_reply: bool
+    can_delete_received_messages: bool | None = None
 
 
 class StateStore:
@@ -77,6 +79,7 @@ class StateStore:
                     dc_id INTEGER NOT NULL,
                     enabled INTEGER NOT NULL,
                     can_reply INTEGER NOT NULL,
+                    can_delete_received_messages INTEGER,
                     updated_at REAL NOT NULL
                 );
 
@@ -85,6 +88,7 @@ class StateStore:
                     chat_id INTEGER NOT NULL,
                     copy_enabled INTEGER NOT NULL DEFAULT 0,
                     autobot_enabled INTEGER NOT NULL DEFAULT 0,
+                    mute_enabled INTEGER NOT NULL DEFAULT 0,
                     updated_at REAL NOT NULL,
                     PRIMARY KEY (connection_id, chat_id),
                     CHECK (copy_enabled = 0 OR autobot_enabled = 0)
@@ -112,6 +116,21 @@ class StateStore:
                     ON conversation_history (connection_id, chat_id, id DESC);
                 """
             )
+            self._ensure_column(
+                "business_connections",
+                "can_delete_received_messages",
+                "INTEGER",
+            )
+            self._ensure_column(
+                "conversation_modes",
+                "mute_enabled",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+
+    def _ensure_column(self, table: str, column: str, definition: str) -> None:
+        columns = {row["name"] for row in self._db.execute(f"PRAGMA table_info({table})")}
+        if column not in columns:
+            self._db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     def _expire_old_records(self) -> None:
         now = time.time()
@@ -136,30 +155,49 @@ class StateStore:
         dc_id: int,
         enabled: bool,
         can_reply: bool,
+        can_delete_received_messages: bool = False,
     ) -> ConnectionInfo:
         now = time.time()
         with self._transaction():
             self._db.execute(
                 """
                 INSERT INTO business_connections
-                    (connection_id, owner_id, dc_id, enabled, can_reply, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                    (connection_id, owner_id, dc_id, enabled, can_reply,
+                     can_delete_received_messages, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(connection_id) DO UPDATE SET
                     owner_id=excluded.owner_id,
                     dc_id=excluded.dc_id,
                     enabled=excluded.enabled,
                     can_reply=excluded.can_reply,
+                    can_delete_received_messages=excluded.can_delete_received_messages,
                     updated_at=excluded.updated_at
                 """,
-                (connection_id, owner_id, dc_id, int(enabled), int(can_reply), now),
+                (
+                    connection_id,
+                    owner_id,
+                    dc_id,
+                    int(enabled),
+                    int(can_reply),
+                    int(can_delete_received_messages),
+                    now,
+                ),
             )
-        return ConnectionInfo(connection_id, owner_id, dc_id, enabled, can_reply)
+        return ConnectionInfo(
+            connection_id,
+            owner_id,
+            dc_id,
+            enabled,
+            can_reply,
+            can_delete_received_messages,
+        )
 
     def get_connection(self, connection_id: str) -> ConnectionInfo | None:
         with self._lock:
             row = self._db.execute(
                 """
-                SELECT connection_id, owner_id, dc_id, enabled, can_reply
+                SELECT connection_id, owner_id, dc_id, enabled, can_reply,
+                       can_delete_received_messages
                 FROM business_connections WHERE connection_id = ?
                 """,
                 (connection_id,),
@@ -172,13 +210,18 @@ class StateStore:
             dc_id=row["dc_id"],
             enabled=bool(row["enabled"]),
             can_reply=bool(row["can_reply"]),
+            can_delete_received_messages=(
+                bool(row["can_delete_received_messages"])
+                if row["can_delete_received_messages"] is not None
+                else None
+            ),
         )
 
     def get_mode(self, connection_id: str, chat_id: int) -> ConversationMode:
         with self._lock:
             row = self._db.execute(
                 """
-                SELECT copy_enabled, autobot_enabled
+                SELECT copy_enabled, autobot_enabled, mute_enabled
                 FROM conversation_modes
                 WHERE connection_id = ? AND chat_id = ?
                 """,
@@ -186,7 +229,11 @@ class StateStore:
             ).fetchone()
         if row is None:
             return ConversationMode()
-        return ConversationMode(bool(row["copy_enabled"]), bool(row["autobot_enabled"]))
+        return ConversationMode(
+            bool(row["copy_enabled"]),
+            bool(row["autobot_enabled"]),
+            bool(row["mute_enabled"]),
+        )
 
     def change_mode(
         self,
@@ -202,7 +249,7 @@ class StateStore:
         with self._transaction():
             row = self._db.execute(
                 """
-                SELECT copy_enabled, autobot_enabled
+                SELECT copy_enabled, autobot_enabled, mute_enabled
                 FROM conversation_modes
                 WHERE connection_id = ? AND chat_id = ?
                 """,
@@ -210,6 +257,7 @@ class StateStore:
             ).fetchone()
             copy_enabled = bool(row["copy_enabled"]) if row else False
             autobot_enabled = bool(row["autobot_enabled"]) if row else False
+            mute_enabled = bool(row["mute_enabled"]) if row else False
 
             if mode == "copy":
                 copy_enabled = enabled
@@ -223,8 +271,8 @@ class StateStore:
             self._db.execute(
                 """
                 INSERT INTO conversation_modes
-                    (connection_id, chat_id, copy_enabled, autobot_enabled, updated_at)
-                VALUES (?, ?, ?, ?, ?)
+                    (connection_id, chat_id, copy_enabled, autobot_enabled, mute_enabled, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(connection_id, chat_id) DO UPDATE SET
                     copy_enabled=excluded.copy_enabled,
                     autobot_enabled=excluded.autobot_enabled,
@@ -235,11 +283,45 @@ class StateStore:
                     chat_id,
                     int(copy_enabled),
                     int(autobot_enabled),
+                    int(mute_enabled),
                     time.time(),
                 ),
             )
 
-        return ConversationMode(copy_enabled, autobot_enabled)
+        return ConversationMode(copy_enabled, autobot_enabled, mute_enabled)
+
+    def change_mute(self, connection_id: str, chat_id: int, enabled: bool) -> ConversationMode:
+        """Persist the incoming-message mute state without changing other modes."""
+        with self._transaction():
+            row = self._db.execute(
+                """
+                SELECT copy_enabled, autobot_enabled
+                FROM conversation_modes
+                WHERE connection_id = ? AND chat_id = ?
+                """,
+                (connection_id, chat_id),
+            ).fetchone()
+            copy_enabled = bool(row["copy_enabled"]) if row else False
+            autobot_enabled = bool(row["autobot_enabled"]) if row else False
+            self._db.execute(
+                """
+                INSERT INTO conversation_modes
+                    (connection_id, chat_id, copy_enabled, autobot_enabled, mute_enabled, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(connection_id, chat_id) DO UPDATE SET
+                    mute_enabled=excluded.mute_enabled,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    connection_id,
+                    chat_id,
+                    int(copy_enabled),
+                    int(autobot_enabled),
+                    int(enabled),
+                    time.time(),
+                ),
+            )
+        return ConversationMode(copy_enabled, autobot_enabled, enabled)
 
     def consume_limit(
         self,
