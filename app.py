@@ -14,11 +14,12 @@ import os
 import re
 import secrets
 import time
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any
 from urllib.parse import urlsplit
 
 import httpx
@@ -40,7 +41,8 @@ SYSTEM_PROMPT = (
 )
 
 MAX_SPAM_COUNT = 10
-MAX_MESSAGE_UNITS = 3900  # UTF-16 units; stay below Telegram's message length limit.
+MAX_MESSAGE_UNITS = 3900  # UTF-16 units; leave headroom for bot-generated messages.
+TELEGRAM_MAX_MESSAGE_UNITS = 4096  # Incoming messages may use Telegram's full text limit.
 SPAM_WINDOW_SECONDS = 60
 SPAM_COMMANDS_PER_WINDOW = 1
 SPAM_SEND_INTERVAL_SECONDS = 1.05
@@ -98,6 +100,23 @@ class Settings:
             telegram_api_hash=required("TELEGRAM_API_HASH"),
             orcarouter_api_key=required("ORCAROUTER_API_KEY"),
             data_dir=Path(os.environ.get("DATA_DIR", "./data")).expanduser(),
+        )
+
+
+def prepare_data_directory(data_dir: Path) -> None:
+    """Create a private runtime directory for the Telegram session and SQLite state."""
+    data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        # mkdir's mode is ignored when the directory already exists (as on Render
+        # persistent disks), so tighten it explicitly before creating sensitive files.
+        data_dir.chmod(0o700)
+    except OSError as exc:
+        LOGGER.warning(
+            "Could not restrict runtime data directory permissions",
+            extra={
+                "event": "data_directory_permissions_unavailable",
+                "reason": type(exc).__name__,
+            },
         )
 
 
@@ -260,7 +279,10 @@ def render_ping_url(external_url: str | None) -> str | None:
     if (
         parsed.scheme.casefold() != "https"
         or not hostname
-        or not (hostname.casefold() == "onrender.com" or hostname.casefold().endswith(".onrender.com"))
+        or not (
+            hostname.casefold() == "onrender.com"
+            or hostname.casefold().endswith(".onrender.com")
+        )
         or parsed.username is not None
         or parsed.password is not None
         or parsed.path not in {"", "/"}
@@ -547,7 +569,20 @@ class TelegramAutomation:
         text = getattr(message, "message", None) or ""
         command = parse_command(text, self.bot_username) if text else None
         mute_command = command is not None and command.name in {"mute", "unmute"}
-        is_owner_message = bool(getattr(message, "out", False)) or sender_id == info.owner_id
+        is_owner_message = sender_id == info.owner_id
+        unauthorized_mute_command = mute_command and not is_owner_message
+        if unauthorized_mute_command:
+            LOGGER.warning(
+                "Mute control command from non-owner ignored",
+                extra={
+                    "event": "mute_command_unauthorized",
+                    "connection_id": connection_id,
+                    "chat_id": chat_id,
+                    "user_id": sender_id,
+                    "message_id": getattr(message, "id", None),
+                    "command": command.name,
+                },
+            )
         if is_owner_message and not mute_command:
             # The profile owner's regular messages must never be copied, deleted,
             # or answered. Only the owner-facing /mute and /unmute controls pass.
@@ -565,7 +600,7 @@ class TelegramAutomation:
 
             # The unmute control is checked before the mute filter, so it remains
             # usable even when every other incoming message is being deleted.
-            if mute_command:
+            if mute_command and not unauthorized_mute_command:
                 input_peer = None
                 if info.can_reply:
                     try:
@@ -590,6 +625,9 @@ class TelegramAutomation:
                     await self._delete_received_message(info, message, chat_id)
                 else:
                     await self._warn_mute_permission_missing(info, peer_id, context)
+                return
+
+            if unauthorized_mute_command:
                 return
 
             if not info.can_reply:
@@ -650,7 +688,8 @@ class TelegramAutomation:
                 await self._safe_reply(
                     info,
                     peer,
-                    "Mute was not enabled. Grant this bot the Telegram Business permission to delete received messages, then try /mute again.",
+                    "Mute was not enabled. Grant this bot the Telegram Business permission "
+                    "to delete received messages, then try /mute again.",
                     context,
                 )
             LOGGER.warning(
@@ -763,7 +802,8 @@ class TelegramAutomation:
         await self._safe_reply(
             info,
             peer,
-            "Mute is enabled, but Telegram no longer allows this bot to delete incoming messages. Restore the delete-received-messages permission or use /unmute.",
+            "Mute is enabled, but Telegram no longer allows this bot to delete incoming "
+            "messages. Restore the delete-received-messages permission or use /unmute.",
             context,
         )
 
@@ -1228,8 +1268,10 @@ class TelegramAutomation:
         text: str,
         entities: list[Any] | None = None,
     ) -> None:
-        if not text or utf16_length(text) > MAX_MESSAGE_UNITS:
-            raise ValueError("Telegram message must contain 1-3900 UTF-16 units")
+        if not text or utf16_length(text) > TELEGRAM_MAX_MESSAGE_UNITS:
+            raise ValueError(
+                f"Telegram message must contain 1-{TELEGRAM_MAX_MESSAGE_UNITS} UTF-16 units"
+            )
         request = functions.messages.SendMessageRequest(
             peer=peer,
             message=text,
@@ -1272,7 +1314,7 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
 
     try:
         settings = Settings.from_env()
-        settings.data_dir.mkdir(parents=True, exist_ok=True)
+        prepare_data_directory(settings.data_dir)
         state = StateStore(settings.data_dir / "tgibot.sqlite3")
         ai = OrcaRouter(settings.orcarouter_api_key)
 

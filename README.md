@@ -21,6 +21,8 @@ The profile owner remains in control of the allowed chats and permissions. The b
 - `/mute` — delete each new incoming message in this private DM for both sides, until `/unmute`. `/mute on` is also accepted. It does not delete messages already in the chat. While muted, only `/mute` and `/unmute` commands are processed; other incoming commands/messages are deleted too. Requires the Telegram **Delete received messages** business permission.
 - `/unmute` — stop deleting new incoming messages in this DM. `/unmute off` is also accepted. This command is checked before mute filtering so it remains usable while muted.
 
+Only the connected profile owner can issue `/mute` or `/unmute`; other participants cannot change mute state.
+
 Copy and autobot are mutually exclusive. Mute is an independent override: while muted, copy and AI replies pause, then resume after `/unmute` if their mode is still enabled. Modes persist for each `(business connection, private chat)` until switched off; they survive process restarts when the Render disk is attached. `/autobot off` is never rate-limited. Enabling autobot is limited to 3 activations per 5 minutes, and AI calls are limited to 12 per private chat per hour. These limits, plus the spam cooldown, are stored in SQLite rather than reset on each process restart.
 
 ## Configuration
@@ -85,7 +87,7 @@ A healthy process returns `{"status":"ok"}` from `/health` only while its MTProt
 
 ## State, privacy, and operations
 
-`state.py` stores connection permissions, copy/autobot/mute modes, rate-limit windows, and recent AI conversation turns in SQLite. SQLite uses transactions, WAL, and `synchronous=FULL`; the Telegram MTProto authorization session is stored separately in the same data directory and restricted to owner-readable permissions where supported. The last 24 AI history messages per conversation are retained for context and history older than 30 days is pruned when the service starts. Text and captions in autobot-enabled chats are sent to OrcaRouter; media bytes are not. Mute deletes only new incoming messages after activation, and only when Telegram's `delete_received_messages` permission is present. Do not share or expose the persistent disk.
+`state.py` stores connection permissions, copy/autobot/mute modes, rate-limit windows, and recent AI conversation turns in SQLite. SQLite uses transactions, WAL, and `synchronous=FULL`. The runtime data directory is restricted to owner-only access where supported; the database, SQLite WAL/shared-memory sidecars, and Telegram MTProto authorization session are also restricted to owner-only permissions. The last 24 AI history messages per conversation are retained for context and history older than 30 days is pruned when the service starts. Text and captions in autobot-enabled chats are sent to OrcaRouter; media bytes are not. Mute deletes only new incoming messages after activation, and only when Telegram's `delete_received_messages` permission is present. Do not share or expose the persistent disk.
 
 Logs are newline-delimited JSON with UTC timestamps, event names, connection/chat/user IDs, command names, API status, and elapsed time. Message contents and secrets are intentionally excluded.
 

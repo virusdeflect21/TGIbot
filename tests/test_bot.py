@@ -1,25 +1,30 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sqlite3
+import stat
 import tempfile
-from types import SimpleNamespace
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 from app import (
     MAX_MESSAGE_UNITS,
+    TELEGRAM_MAX_MESSAGE_UNITS,
     TelegramAutomation,
     app,
     Command,
     parse_command,
     parse_spam_args,
     ping,
+    prepare_data_directory,
     render_ping_url,
     split_telegram_text,
     utf16_length,
 )
-from state import ConversationMode, StateStore
+from state import ConnectionInfo, ConversationMode, StateStore
 from telethon import functions, types
 
 
@@ -29,7 +34,10 @@ class RenderLivenessTests(unittest.TestCase):
         self.assertEqual(asyncio.run(ping()), {"status": "alive"})
 
     def test_render_external_url_builds_only_a_safe_ping_url(self) -> None:
-        self.assertEqual(render_ping_url("https://tgibot.onrender.com/"), "https://tgibot.onrender.com/ping")
+        self.assertEqual(
+            render_ping_url("https://tgibot.onrender.com/"),
+            "https://tgibot.onrender.com/ping",
+        )
         for invalid in (
             None,
             "http://tgibot.onrender.com",
@@ -55,7 +63,10 @@ class CommandParsingTests(unittest.TestCase):
             Command("copy", "off"),
         )
         self.assertIsNone(parse_command("/copy@another_bot on", "tgibot"))
-        self.assertEqual(parse_command("/UNMUTE@tgibot", "TGIbot"), Command("unmute", ""))
+        self.assertEqual(
+            parse_command("/UNMUTE@tgibot", "TGIbot"),
+            Command("unmute", ""),
+        )
 
     def test_invalid_spam_arguments_are_rejected(self) -> None:
         for args in ("", "0 hello", "11 hello", "three hello", "3", "3   ", "9" * 5000 + " hello"):
@@ -162,10 +173,14 @@ class TelegramMuteTests(unittest.TestCase):
             functions.messages.DeleteMessagesRequest,
         )
 
-    def test_unmute_is_processed_before_muted_message_deletion(self) -> None:
+    def test_owner_can_unmute_while_muted(self) -> None:
         self.store.change_mute(self.connection_id, self.chat_id, True)
 
-        asyncio.run(self.automation._handle_business_message(self.update("/unmute")))
+        asyncio.run(
+            self.automation._handle_business_message(
+                self.update("/unmute", sender_id=42, outgoing=True)
+            )
+        )
 
         self.assertFalse(self.store.get_mode(self.connection_id, self.chat_id).mute_enabled)
         self.assertEqual(len(self.client.business_requests), 1)
@@ -174,6 +189,28 @@ class TelegramMuteTests(unittest.TestCase):
             functions.messages.SendMessageRequest,
         )
         self.assertIn("Mute is off", self.client.business_requests[0].query.message)
+
+    def test_other_participant_cannot_mute_or_unmute(self) -> None:
+        # The sender identity, not the message direction flag, grants control.
+        asyncio.run(
+            self.automation._handle_business_message(
+                self.update("/mute", outgoing=True)
+            )
+        )
+
+        self.assertFalse(self.store.get_mode(self.connection_id, self.chat_id).mute_enabled)
+        self.assertEqual(self.client.business_requests, [])
+
+        self.store.change_mute(self.connection_id, self.chat_id, True)
+        asyncio.run(self.automation._handle_business_message(self.update("/unmute")))
+
+        self.assertTrue(self.store.get_mode(self.connection_id, self.chat_id).mute_enabled)
+        self.assertEqual(len(self.client.business_requests), 1)
+        self.assertIsInstance(
+            self.client.business_requests[0].query,
+            functions.messages.DeleteMessagesRequest,
+        )
+        self.assertEqual(self.client.business_requests[0].query.id, [321])
 
     def test_profile_owner_can_issue_mute_control_but_regular_text_is_ignored(self) -> None:
         asyncio.run(
@@ -225,7 +262,11 @@ class TelegramMuteTests(unittest.TestCase):
             can_delete_received_messages=False,
         )
 
-        asyncio.run(self.automation._handle_business_message(self.update("/mute")))
+        asyncio.run(
+            self.automation._handle_business_message(
+                self.update("/mute", sender_id=42, outgoing=True)
+            )
+        )
 
         self.assertFalse(self.store.get_mode(self.connection_id, self.chat_id).mute_enabled)
         self.assertEqual(len(self.client.business_requests), 1)
@@ -233,7 +274,49 @@ class TelegramMuteTests(unittest.TestCase):
             self.client.business_requests[0].query,
             functions.messages.SendMessageRequest,
         )
-        self.assertIn("delete received messages", self.client.business_requests[0].query.message.casefold())
+        self.assertIn(
+            "delete received messages",
+            self.client.business_requests[0].query.message.casefold(),
+        )
+
+
+class TelegramMessageSendingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_send_text_accepts_telegram_maximum_message_length(self) -> None:
+        automation = object.__new__(TelegramAutomation)
+        automation._invoke_business = AsyncMock()
+        info = ConnectionInfo("bc-test", 1, 2, True, True)
+        text = "x" * TELEGRAM_MAX_MESSAGE_UNITS
+
+        await automation._send_text(info, object(), text)
+
+        automation._invoke_business.assert_awaited_once()
+
+    async def test_send_text_rejects_text_over_telegram_limit(self) -> None:
+        automation = object.__new__(TelegramAutomation)
+        automation._invoke_business = AsyncMock()
+        info = ConnectionInfo("bc-test", 1, 2, True, True)
+
+        with self.assertRaises(ValueError):
+            await automation._send_text(
+                info,
+                object(),
+                "x" * (TELEGRAM_MAX_MESSAGE_UNITS + 1),
+            )
+
+        automation._invoke_business.assert_not_awaited()
+
+
+@unittest.skipUnless(os.name == "posix", "POSIX file permissions are required")
+class RuntimeFilePermissionTests(unittest.TestCase):
+    def test_existing_data_directory_is_restricted(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_dir = Path(temp_dir) / "data"
+            data_dir.mkdir(mode=0o755)
+            data_dir.chmod(0o755)
+
+            prepare_data_directory(data_dir)
+
+            self.assertEqual(stat.S_IMODE(data_dir.stat().st_mode), 0o700)
 
 
 class StateStoreTests(unittest.TestCase):
@@ -287,6 +370,21 @@ class StateStoreTests(unittest.TestCase):
             reopened.close()
         self.store = StateStore(self.db_path)
 
+    def test_mute_mode_preserves_autobot_mode(self) -> None:
+        connection_id, chat_id = "bc-autobot-mute", 789
+        self.store.change_mode(connection_id, chat_id, "autobot", True)
+
+        mode = self.store.change_mute(connection_id, chat_id, True)
+
+        self.assertEqual(
+            mode,
+            ConversationMode(autobot_enabled=True, mute_enabled=True),
+        )
+        self.assertEqual(
+            self.store.change_mute(connection_id, chat_id, False),
+            ConversationMode(autobot_enabled=True),
+        )
+
     def test_connection_metadata_round_trips(self) -> None:
         expected = self.store.save_connection(
             "bc-2", 42, 4, True, True, can_delete_received_messages=True
@@ -333,6 +431,17 @@ class StateStoreTests(unittest.TestCase):
             self.assertTrue(migrated.get_mode("bc-old", 99).mute_enabled)
         finally:
             migrated.close()
+
+    @unittest.skipUnless(os.name == "posix", "POSIX file permissions are required")
+    def test_database_and_sqlite_sidecars_are_owner_only(self) -> None:
+        self.store.save_connection("bc-private", 42, 4, True, True)
+
+        self.assertEqual(stat.S_IMODE(self.db_path.stat().st_mode), 0o600)
+        for suffix in ("-wal", "-shm"):
+            sidecar = Path(f"{self.db_path}{suffix}")
+            if sidecar.exists():
+                with self.subTest(sidecar=sidecar.name):
+                    self.assertEqual(stat.S_IMODE(sidecar.stat().st_mode), 0o600)
 
     def test_fixed_window_rate_limit(self) -> None:
         scope, connection_id, user_id = "spam", "bc-rate", 456
